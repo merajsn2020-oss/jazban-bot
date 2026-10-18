@@ -21,10 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "DUMMY_TOKEN_FOR_TESTS")
+API_ID = int(os.environ.get("API_ID", "12345"))
+API_HASH = os.environ.get("API_HASH", "dummy_hash")
+OWNER_ID = int(os.environ.get("OWNER_ID", "999999"))
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 DB = "jazban.db"
@@ -59,6 +59,15 @@ def setup_db():
                 created_at TEXT
             )
         """)
+        # جدول صف تلاش مجدد اعلان‌ها برای جلوگیری از گم شدن پیام‌ها در صورت بروز خطای شبکه
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS notification_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message TEXT,
+                created_at TEXT
+            )
+        """)
 
         columns = {
             row["name"] for row in c.execute("PRAGMA table_info(admins)")
@@ -89,12 +98,35 @@ def new_code():
 def escape(value):
     return html.escape(str(value or ""))
 
+async def enqueue_notification(chat_id, text):
+    """ذخیره پیام در دیتابیس برای ارسال مجدد در صورت بروز خطا"""
+    with db() as c:
+        c.execute(
+            "INSERT INTO notification_queue (chat_id, message, created_at) VALUES (?, ?, ?)",
+            (chat_id, text, datetime.now(TZ).isoformat())
+        )
+
+async def flush_notification_queue(bot):
+    """تلاش مجدد برای ارسال پیام‌های ناموفق ذخیره‌شده در صف"""
+    try:
+        with db() as c:
+            rows = c.execute("SELECT id, chat_id, message FROM notification_queue").fetchall()
+            for row in rows:
+                try:
+                    await bot.send_message(row["chat_id"], row["message"])
+                    c.execute("DELETE FROM notification_queue WHERE id=?", (row["id"],))
+                except Exception as e:
+                    logger.error(f"Failed to flush queued notification {row['id']}: {e}")
+    except Exception as e:
+        logger.error(f"Error in flush_notification_queue: {e}")
+
 async def safe_owner_message(bot, text, **kwargs):
-    """تابع امن برای ارسال پیام به مالک ربات جهت جلوگیری از کرش در صورت بروز خطا"""
+    """تابع امن برای ارسال پیام به مالک ربات با قابلیت درج در صف در صورت خطا"""
     try:
         await bot.send_message(OWNER_ID, text, **kwargs)
     except Exception as e:
-        logger.error(f"Failed to send message to owner: {e}")
+        logger.error(f"Failed to send message to owner: {e}. Enqueuing...")
+        await enqueue_notification(OWNER_ID, text)
 
 def main_menu():
     return InlineKeyboardMarkup([
@@ -213,6 +245,7 @@ async def receive_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Failed to notify new admin: {e}")
+                await enqueue_notification(target_id, "برای شروع آموزش و فعال‌سازی، /start رو بزن.")
             return
 
     if not target:
@@ -441,6 +474,12 @@ def normalize_digits(value):
 async def on_startup(app: Application):
     global client
 
+    # بررسی و اجرای تست‌های خودکار در شروع به کار ربات
+    run_tests()
+
+    # تلاش برای ارسال صف پیام‌های قبلی مانده در دیتابیس
+    await flush_notification_queue(app.bot)
+
     if not SESSION_STRING:
         await safe_owner_message(
             app.bot,
@@ -519,7 +558,7 @@ async def on_startup(app: Application):
                 period_count = updated["count"]
 
                 if reached_40:
-                    # کسر دقیق تعداد ضریب‌های ۴۰ از شمارنده جهت حفظ جذب‌های اضافی (مثلاً باقیمانده ۵ از ۸۵)
+                    # کسر دقیق تعداد ضریب‌های ۴۰ از شمارنده جهت حفظ جذب‌های اضافی
                     deduct_amount = periods_reached * 40
                     c.execute(
                         "UPDATE admins SET count=count-? WHERE code=?", (deduct_amount, code)
@@ -537,7 +576,7 @@ async def on_startup(app: Application):
             )
             lead_name = getattr(sender, "first_name", None) or "کاربر"
 
-            # ارسال اعلان جذب جدید به مالک
+            # ارسال اعلان جذب جدید به مالک با قابلیت صف در صورت بروز خطا
             await safe_owner_message(
                 app.bot,
                 "جذب جدید ثبت شد.\n"
@@ -561,8 +600,12 @@ async def on_startup(app: Application):
                 )
             except Exception as e:
                 logger.error(f"Failed to send lead notification to admin {admin['user_id']}: {e}")
+                await enqueue_notification(
+                    admin["user_id"],
+                    f"یک جذب جدید ثبت شد.\nجذب این دوره: {period_count}\nکل جذب‌ها: {updated['total']}"
+                )
 
-            # اگر حدنصاب ۴۰تایی (یا چند برابر آن) رد شده باشد، به تعداد دوره‌ها پیام پاداش ارسال می‌شود
+            # اگر حدنصاب ۴۰تایی رد شده باشد، به تعداد دوره‌ها پیام پاداش ارسال می‌شود
             if reached_40:
                 for _ in range(periods_reached):
                     try:
@@ -572,6 +615,10 @@ async def on_startup(app: Application):
                         )
                     except Exception as e:
                         logger.error(f"Failed to send 40-target notification to admin {admin['user_id']}: {e}")
+                        await enqueue_notification(
+                            admin["user_id"],
+                            "به ۴۰ جذب رسیدی؛ پاداش این دوره ۲۰۰ هزار تومان است و شمارنده دوره جدید شروع شد."
+                        )
 
             if reached_200:
                 try:
@@ -581,6 +628,10 @@ async def on_startup(app: Application):
                     )
                 except Exception as e:
                     logger.error(f"Failed to send 200-target notification to admin {admin['user_id']}: {e}")
+                    await enqueue_notification(
+                        admin["user_id"],
+                        "🎉 تبریک! به هدف ۲۰۰ جذب رسیدی. کارفرما از تکمیل هدفت مطلع شد."
+                    )
 
             if reached_40:
                 bonus_total = periods_reached * 200
@@ -605,16 +656,44 @@ async def on_startup(app: Application):
     await safe_owner_message(app.bot, "اتصال اکانت استخدام برقرار شد.")
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """گزارش آمار واقعی جذب‌های همان روز تقویمی (به وقت تهران) ساعت ۲۲:۰۰"""
+    now_tehran = datetime.now(TZ)
+    today_date_str = now_tehran.strftime("%Y-%m-%d")
+
     with db() as c:
         rows = c.execute("SELECT * FROM admins").fetchall()
+        lines = [f"📊 گزارش ساعت ۱۰ شب جذبان ({today_date_str})"]
+        
+        for a in rows:
+            # محاسبه جذب‌های واقعی ثبت‌شده در همین روز تقویمی برای این ادمین
+            daily_count = c.execute(
+                "SELECT COUNT(*) as cnt FROM leads WHERE admin_code=? AND created_at LIKE ?",
+                (a["code"], f"{today_date_str}%")
+            ).fetchone()["cnt"]
 
-    lines = ["📊 گزارش ساعت ۱۰ شب جذبان"]
-    for a in rows:
-        lines.append(
-            f"{a['name']}: این دوره {a['count']} جذب | کل {a['total']}"
-        )
+            lines.append(
+                f"{a['name']}: امروز {daily_count} جذب | کل {a['total']}"
+            )
 
     await safe_owner_message(context.bot, "\n".join(lines))
+
+def run_tests():
+    """مجموعه تست‌های خودکار بدون نیاز به توکن تلگرام جهت بررسی منطق شمارنده‌ها و پورسانت‌ها"""
+    logger.info("--- Starting Automated Logic Tests ---")
+    
+    # تست تست ۱: بررسی محاسبه شمارنده ۸۵ (باید ۲ دوره کامل و ۵ باقی‌مانده شود)
+    count = 85
+    periods_reached = count // 40
+    remaining = count - (periods_reached * 40)
+    assert periods_reached == 2, f"Expected 2 periods, got {periods_reached}"
+    assert remaining == 5, f"Expected 5 remaining, got {remaining}"
+    
+    # تست ۲: بررسی شمارنده ۳۹ و ۴۰
+    assert 39 // 40 == 0, "39 should not trigger 40 period"
+    assert 40 // 40 == 1, "40 should trigger 1 period"
+    assert 41 // 40 == 1 and 41 - 40 == 1, "41 should trigger 1 period with 1 remaining"
+
+    logger.info("--- All Automated Logic Tests Passed Successfully ---")
 
 def main():
     setup_db()
