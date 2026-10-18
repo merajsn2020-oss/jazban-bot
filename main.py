@@ -1,5 +1,7 @@
 import os
 import re
+import asyncio
+from contextlib import contextmanager
 import html
 import sqlite3
 import logging
@@ -34,14 +36,24 @@ TARGET_TOTAL = 200
 OWNER_ID = 0
 client = None
 awaiting_admin = set()
+_notification_flush_lock = asyncio.Lock()
 
 
+@contextmanager
 def db():
+    """Open a short-lived SQLite connection and always close it."""
     conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def setup_db():
@@ -52,8 +64,23 @@ def setup_db():
             count INTEGER DEFAULT 0, total INTEGER DEFAULT 0, activated_at TEXT,
             training_done INTEGER DEFAULT 0, notified_200 INTEGER DEFAULT 0
         )""")
+        admin_cols = {r["name"] for r in c.execute("PRAGMA table_info(admins)")}
+        admin_migrations = {
+            "username": "ALTER TABLE admins ADD COLUMN username TEXT",
+            "name": "ALTER TABLE admins ADD COLUMN name TEXT",
+            "code": "ALTER TABLE admins ADD COLUMN code TEXT",
+            "count": "ALTER TABLE admins ADD COLUMN count INTEGER DEFAULT 0",
+            "total": "ALTER TABLE admins ADD COLUMN total INTEGER DEFAULT 0",
+            "activated_at": "ALTER TABLE admins ADD COLUMN activated_at TEXT",
+            "training_done": "ALTER TABLE admins ADD COLUMN training_done INTEGER DEFAULT 0",
+            "notified_200": "ALTER TABLE admins ADD COLUMN notified_200 INTEGER DEFAULT 0",
+        }
+        for col, sql in admin_migrations.items():
+            if col not in admin_cols:
+                c.execute(sql)
         c.execute("""CREATE TABLE IF NOT EXISTS leads (
-            user_id INTEGER PRIMARY KEY, admin_code TEXT, created_at TEXT
+            user_id INTEGER PRIMARY KEY, admin_code TEXT, created_at TEXT,
+            admin_user_id INTEGER
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS notification_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
@@ -61,14 +88,6 @@ def setup_db():
             attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
             dedupe_key TEXT
         )""")
-        admin_cols = {r["name"] for r in c.execute("PRAGMA table_info(admins)")}
-        for col, sql in {
-            "activated_at": "ALTER TABLE admins ADD COLUMN activated_at TEXT",
-            "training_done": "ALTER TABLE admins ADD COLUMN training_done INTEGER DEFAULT 0",
-            "notified_200": "ALTER TABLE admins ADD COLUMN notified_200 INTEGER DEFAULT 0",
-        }.items():
-            if col not in admin_cols:
-                c.execute(sql)
         queue_cols = {r["name"] for r in c.execute("PRAGMA table_info(notification_queue)")}
         for col, sql in {
             "attempts": "ALTER TABLE notification_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
@@ -77,24 +96,36 @@ def setup_db():
         }.items():
             if col not in queue_cols:
                 c.execute(sql)
+        lead_cols = {r["name"] for r in c.execute("PRAGMA table_info(leads)")}
+        for col, sql in {
+            "admin_code": "ALTER TABLE leads ADD COLUMN admin_code TEXT",
+            "created_at": "ALTER TABLE leads ADD COLUMN created_at TEXT",
+            "admin_user_id": "ALTER TABLE leads ADD COLUMN admin_user_id INTEGER",
+        }.items():
+            if col not in lead_cols:
+                c.execute(sql)
+        # Preserve historical rows while associating them with a stable admin ID.
+        c.execute("""UPDATE leads SET admin_user_id=(
+                    SELECT user_id FROM admins WHERE admins.code=leads.admin_code
+                ) WHERE admin_user_id IS NULL""")
         c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_dedupe
                      ON notification_queue(dedupe_key) WHERE dedupe_key IS NOT NULL""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leads_admin_code ON leads(admin_code)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leads_admin_user_id ON leads(admin_user_id)")
 
 
 def new_code(conn=None):
-    own = conn is None
-    c = conn or db()
-    try:
-        used = {r["code"] for r in c.execute("SELECT code FROM admins WHERE code IS NOT NULL")}
-        n = 10
-        while str(n) in used:
-            n += 1
-        return str(n)
-    finally:
-        if own:
-            c.close()
+    if conn is None:
+        with db() as c:
+            return new_code(c)
+    used = {str(r["code"]) for r in conn.execute(
+        "SELECT code FROM admins WHERE code IS NOT NULL"
+    )}
+    n = 10
+    while str(n) in used:
+        n += 1
+    return str(n)
 
 
 def escape(value):
@@ -115,30 +146,31 @@ async def enqueue_notification(chat_id, message, dedupe_key=None):
 
 
 async def flush_notification_queue(bot, limit=50):
-    """Retry queued messages with backoff. Never hold a DB transaction over network I/O."""
-    try:
-        now = datetime.now(TZ).isoformat()
-        with db() as c:
-            rows = c.execute("""SELECT id, chat_id, message, attempts
-                FROM notification_queue
-                WHERE next_attempt_at IS NULL OR next_attempt_at <= ?
-                ORDER BY id LIMIT ?""", (now, limit)).fetchall()
-        for row in rows:
-            try:
-                await bot.send_message(chat_id=row["chat_id"], text=row["message"])
-            except Exception as exc:
-                attempts = int(row["attempts"] or 0) + 1
-                delay = min(60 * (2 ** min(attempts, 6)), 3600)
-                next_time = (datetime.now(TZ) + timedelta(seconds=delay)).isoformat()
-                logger.warning("Queued notification %s failed (attempt %s): %s", row["id"], attempts, exc)
-                with db() as c:
-                    c.execute("UPDATE notification_queue SET attempts=?, next_attempt_at=? WHERE id=?",
-                              (attempts, next_time, row["id"]))
-            else:
-                with db() as c:
-                    c.execute("DELETE FROM notification_queue WHERE id=?", (row["id"],))
-    except Exception:
-        logger.exception("Notification queue processing failed")
+    """Retry queued messages with backoff; serialize flushes to reduce duplicate sends."""
+    async with _notification_flush_lock:
+        try:
+            now = datetime.now(TZ).isoformat()
+            with db() as c:
+                rows = c.execute("""SELECT id, chat_id, message, attempts
+                    FROM notification_queue
+                    WHERE next_attempt_at IS NULL OR next_attempt_at <= ?
+                    ORDER BY id LIMIT ?""", (now, limit)).fetchall()
+            for row in rows:
+                try:
+                    await bot.send_message(chat_id=row["chat_id"], text=row["message"])
+                except Exception as exc:
+                    attempts = int(row["attempts"] or 0) + 1
+                    delay = min(60 * (2 ** min(attempts, 6)), 3600)
+                    next_time = (datetime.now(TZ) + timedelta(seconds=delay)).isoformat()
+                    logger.warning("Queued notification %s failed (attempt %s): %s", row["id"], attempts, exc)
+                    with db() as c:
+                        c.execute("UPDATE notification_queue SET attempts=?, next_attempt_at=? WHERE id=?",
+                                  (attempts, next_time, row["id"]))
+                else:
+                    with db() as c:
+                        c.execute("DELETE FROM notification_queue WHERE id=?", (row["id"],))
+        except Exception:
+            logger.exception("Notification queue processing failed")
 
 
 async def safe_owner_message(bot, message, dedupe_key=None):
@@ -345,7 +377,8 @@ async def process_lead(app, sender, code):
         if not admin or not admin["training_done"]:
             return False
         try:
-            c.execute("INSERT INTO leads (user_id, admin_code, created_at) VALUES (?, ?, ?)", (sender.id, code, now))
+            c.execute("INSERT INTO leads (user_id, admin_code, created_at, admin_user_id) VALUES (?, ?, ?, ?)",
+                      (sender.id, code, now, admin["user_id"]))
         except sqlite3.IntegrityError:
             # A Telegram user can only count once globally.
             return False
@@ -353,8 +386,7 @@ async def process_lead(app, sender, code):
         c.execute("UPDATE admins SET count=COALESCE(count,0)+1, total=COALESCE(total,0)+1 WHERE code=?", (code,))
         updated = c.execute("SELECT * FROM admins WHERE code=?", (code,)).fetchone()
         current_count = int(updated["count"] or 0)
-        periods = current_count // BONUS_EVERY
-        remainder = current_count % BONUS_EVERY
+        periods, remainder = counter_transition(current_count - 1, 1)
         if periods:
             c.execute("UPDATE admins SET count=? WHERE code=?", (remainder, code))
             updated = c.execute("SELECT * FROM admins WHERE code=?", (code,)).fetchone()
@@ -443,21 +475,35 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
         admins = c.execute("SELECT * FROM admins ORDER BY total DESC").fetchall()
         lines = [f"ð Ú¯Ø²Ø§Ø±Ø´ Ø³Ø§Ø¹Øª Û±Û° Ø´Ø¨ Ø¬Ø°Ø¨Ø§Ù ({today.isoformat()})"]
         for a in admins:
-            daily = c.execute("SELECT COUNT(*) AS cnt FROM leads WHERE admin_code=? AND created_at>=? AND created_at<?",
-                              (a["code"], start, end)).fetchone()["cnt"]
+            daily = c.execute("""SELECT COUNT(*) AS cnt FROM leads
+                              WHERE (admin_user_id=? OR (admin_user_id IS NULL AND admin_code=?))
+                              AND created_at>=? AND created_at<?""",
+                              (a["user_id"], a["code"], start, end)).fetchone()["cnt"]
             lines.append(f"{a['name'] or a['user_id']}: Ø§ÙØ±ÙØ² {daily} Ø¬Ø°Ø¨ | Ú©Ù {a['total']}")
     await safe_owner_message(context.bot, "\n".join(lines), f"daily-report:{today.isoformat()}")
 
 
+def counter_transition(current_count, added=1):
+    """Return (completed bonus periods, remainder) for a period counter."""
+    if current_count < 0 or added < 0:
+        raise ValueError("counts cannot be negative")
+    value = current_count + added
+    return value // BONUS_EVERY, value % BONUS_EVERY
+
+
 def run_tests():
-    for count, expected_periods, expected_remainder in [
-        (39, 0, 39), (40, 1, 0), (41, 1, 1), (79, 1, 39),
-        (80, 2, 0), (81, 2, 1), (85, 2, 5),
-    ]:
-        assert count // BONUS_EVERY == expected_periods, count
-        assert count % BONUS_EVERY == expected_remainder, count
-    assert 199 < TARGET_TOTAL and 200 >= TARGET_TOTAL and 201 >= TARGET_TOTAL
-    logger.info("Offline counter tests passed.")
+    cases = {
+        39: (0, 39), 40: (1, 0), 41: (1, 1), 79: (1, 39),
+        80: (2, 0), 81: (2, 1), 85: (2, 5), 199: (4, 39),
+        200: (5, 0), 201: (5, 1),
+    }
+    for total_count, expected in cases.items():
+        actual = counter_transition(0, total_count)
+        assert actual == expected, (total_count, actual, expected)
+    assert counter_transition(39, 1) == (1, 0)
+    assert counter_transition(39, 2) == (1, 1)
+    assert TARGET_TOTAL == 200 and BONUS_EVERY == 40 and BONUS_TOMAN == 200_000
+    logger.info("Offline counter boundary tests passed.")
 
 
 def validate_config():
@@ -468,6 +514,8 @@ def validate_config():
         missing.append("OWNER_ID")
     if missing:
         raise RuntimeError("Environment variables missing: " + ", ".join(missing))
+    if SESSION_STRING and (not API_ID_RAW or not API_HASH):
+        raise RuntimeError("SESSION_STRING requires both API_ID and API_HASH")
     try:
         return int(OWNER_ID_RAW)
     except ValueError as exc:
