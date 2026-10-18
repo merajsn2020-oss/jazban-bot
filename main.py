@@ -463,129 +463,138 @@ async def on_startup(app: Application):
 
     @client.on(events.NewMessage(incoming=True))
     async def incoming(event):
-        if not event.is_private or event.out:
-            return
-
-        incoming_text = normalize_digits(event.raw_text or "")
-        match = re.search(
-            r"استخدام\s+کد\s*(\d+)", incoming_text, re.IGNORECASE
-        )
-        if not match:
-            return
-
-        code = match.group(1)
-        sender = await event.get_sender()
-
-        if not sender or getattr(sender, "bot", False):
-            return
-
-        with db() as c:
-            admin = c.execute(
-                "SELECT * FROM admins WHERE code=?", (code,)
-            ).fetchone()
-
-            if not admin or not admin["training_done"]:
-                return
-
-            exists = c.execute(
-                "SELECT 1 FROM leads WHERE user_id=?", (sender.id,)
-            ).fetchone()
-
-            if exists:
-                return
-
-            now = datetime.now(TZ).isoformat()
-
-            c.execute(
-                "INSERT INTO leads (user_id, admin_code, created_at) VALUES (?, ?, ?)",
-                (sender.id, code, now),
-            )
-            c.execute(
-                "UPDATE admins SET count=count+1, total=total+1 WHERE code=?",
-                (code,),
-            )
-
-            updated = c.execute(
-                "SELECT * FROM admins WHERE code=?", (code,)
-            ).fetchone()
-
-            reached_40 = updated["count"] >= 40
-            reached_200 = (
-                updated["total"] >= 200 and not updated["notified_200"]
-            )
-            period_count = updated["count"]
-
-            if reached_40:
-                c.execute(
-                    "UPDATE admins SET count=0 WHERE code=?", (code,)
-                )
-
-            if reached_200:
-                c.execute(
-                    "UPDATE admins SET notified_200=1 WHERE code=?", (code,)
-                )
-
-        username = getattr(sender, "username", None)
-        user_link = (
-            f"https://t.me/{username}"
-            if username else f"tg://user?id={sender.id}"
-        )
-        lead_name = getattr(sender, "first_name", None) or "کاربر"
-        count_after = 0 if reached_40 else period_count
-
-        await safe_owner_message(
-            app.bot,
-            "جذب جدید ثبت شد.\n"
-            f"ادمین: {admin['name']}\n"
-            f"آیدی ادمین: {admin['user_id']}\n"
-            f"کد ادمین: {code}\n"
-            f"کاربر: {lead_name}\n"
-            f"آیدی کاربر: {sender.id}\n"
-            f"لینک: {user_link}\n"
-            f"جذب این دوره: {count_after}\n"
-            f"کل جذب‌ها: {updated['total']}\n"
-            f"زمان: {now}",
-        )
-
         try:
-            await app.bot.send_message(
-                admin["user_id"],
-                "یک جذب جدید ثبت شد.\n"
-                f"جذب این دوره: {count_after}\n"
-                f"کل جذب‌ها: {updated['total']}",
+            if not event.is_private or event.out:
+                return
+
+            incoming_text = normalize_digits(event.raw_text or "")
+            match = re.search(
+                r"استخدام\s+کد\s*(\d+)", incoming_text, re.IGNORECASE
+            )
+            if not match:
+                return
+
+            code = match.group(1)
+            sender = await event.get_sender()
+
+            if not sender or getattr(sender, "bot", False):
+                return
+
+            with db() as c:
+                admin = c.execute(
+                    "SELECT * FROM admins WHERE code=?", (code,)
+                ).fetchone()
+
+                if not admin or not admin["training_done"]:
+                    return
+
+                exists = c.execute(
+                    "SELECT 1 FROM leads WHERE user_id=?", (sender.id,)
+                ).fetchone()
+
+                if exists:
+                    return
+
+                now = datetime.now(TZ).isoformat()
+
+                c.execute(
+                    "INSERT INTO leads (user_id, admin_code, created_at) VALUES (?, ?, ?)",
+                    (sender.id, code, now),
+                )
+                c.execute(
+                    "UPDATE admins SET count=count+1, total=total+1 WHERE code=?",
+                    (code,),
+                )
+
+                updated = c.execute(
+                    "SELECT * FROM admins WHERE code=?", (code,)
+                ).fetchone()
+
+                reached_40 = updated["count"] >= 40
+                reached_200 = (
+                    updated["total"] >= 200 and not updated["notified_200"]
+                )
+                period_count = updated["count"]
+
+                if reached_40:
+                    # کسر دقیق ۴۰ از شمارنده برای حفظ جذب‌های اضافه
+                    c.execute(
+                        "UPDATE admins SET count=count-40 WHERE code=?", (code,)
+                    )
+
+                if reached_200:
+                    c.execute(
+                        "UPDATE admins SET notified_200=1 WHERE code=?", (code,)
+                    )
+
+            username = getattr(sender, "username", None)
+            user_link = (
+                f"https://t.me/{username}"
+                if username else f"tg://user?id={sender.id}"
+            )
+            lead_name = getattr(sender, "first_name", None) or "کاربر"
+
+            # مدیریت جداگانه ارسال پیام‌ها به مالک و ادمین
+            await safe_owner_message(
+                app.bot,
+                "جذب جدید ثبت شد.\n"
+                f"ادمین: {admin['name']}\n"
+                f"آیدی ادمین: {admin['user_id']}\n"
+                f"کد ادمین: {code}\n"
+                f"کاربر: {lead_name}\n"
+                f"آیدی کاربر: {sender.id}\n"
+                f"لینک: {user_link}\n"
+                f"جذب این دوره: {period_count}\n"
+                f"کل جذب‌ها: {updated['total']}\n"
+                f"زمان: {now}",
             )
 
-            if reached_40:
+            try:
                 await app.bot.send_message(
                     admin["user_id"],
-                    "به ۴۰ جذب رسیدی؛ پاداش این دوره ۲۰۰ هزار تومان است و شمارنده دوره جدید شروع شد.",
+                    "یک جذب جدید ثبت شد.\n"
+                    f"جذب این دوره: {period_count}\n"
+                    f"کل جذب‌ها: {updated['total']}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send lead notification to admin {admin['user_id']}: {e}")
+
+            if reached_40:
+                try:
+                    await app.bot.send_message(
+                        admin["user_id"],
+                        "به ۴۰ جذب رسیدی؛ پاداش این دوره ۲۰۰ هزار تومان است و شمارنده دوره جدید شروع شد.",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send 40-target notification to admin {admin['user_id']}: {e}")
+
+            if reached_200:
+                try:
+                    await app.bot.send_message(
+                        admin["user_id"],
+                        "🎉 تبریک! به هدف ۲۰۰ جذب رسیدی. کارفرما از تکمیل هدفت مطلع شد.",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send 200-target notification to admin {admin['user_id']}: {e}")
+
+            if reached_40:
+                await safe_owner_message(
+                    app.bot,
+                    f"ادمین {admin['name']} (کد {code}) به ۴۰ جذب رسید؛ "
+                    "پرداخت ۲۰۰ هزار تومان باید بررسی شود.",
                 )
 
             if reached_200:
-                await app.bot.send_message(
-                    admin["user_id"],
-                    "🎉 تبریک! به هدف ۲۰۰ جذب رسیدی. کارفرما از تکمیل هدفت مطلع شد.",
+                await safe_owner_message(
+                    app.bot,
+                    "🎉 ادمین به هدف ۲۰۰ جذب رسید!\n"
+                    f"نام: {admin['name']}\n"
+                    f"آیدی: {admin['user_id']}\n"
+                    f"کد: {code}\n"
+                    f"کل جذب‌ها: {updated['total']}",
                 )
-
         except Exception as e:
-            logger.error(f"Failed to send notification to admin {admin['user_id']}: {e}")
-
-        if reached_40:
-            await safe_owner_message(
-                app.bot,
-                f"ادمین {admin['name']} (کد {code}) به ۴۰ جذب رسید؛ "
-                "پرداخت ۲۰۰ هزار تومان باید بررسی شود.",
-            )
-
-        if reached_200:
-            await safe_owner_message(
-                app.bot,
-                "🎉 ادمین به هدف ۲۰۰ جذب رسید!\n"
-                f"نام: {admin['name']}\n"
-                f"آیدی: {admin['user_id']}\n"
-                f"کد: {code}\n"
-                f"کل جذب‌ها: {updated['total']}",
-            )
+            logger.error(f"Error processing incoming Telethon message: {e}")
 
     await safe_owner_message(app.bot, "اتصال اکانت استخدام برقرار شد.")
 
@@ -626,6 +635,8 @@ def main():
                 tzinfo=TZ
             ),
         )
+    else:
+        logger.warning("JobQueue is not available. Daily report schedule could not be set.")
 
     app.run_polling()
 
