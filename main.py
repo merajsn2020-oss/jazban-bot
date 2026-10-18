@@ -510,16 +510,19 @@ async def on_startup(app: Application):
                     "SELECT * FROM admins WHERE code=?", (code,)
                 ).fetchone()
 
-                reached_40 = updated["count"] >= 40
+                # محاسبه تعداد دوره‌های ۴۰تایی کامل‌شده بر اساس شمارنده فعلی
+                periods_reached = updated["count"] // 40
+                reached_40 = periods_reached > 0
                 reached_200 = (
                     updated["total"] >= 200 and not updated["notified_200"]
                 )
                 period_count = updated["count"]
 
                 if reached_40:
-                    # کسر دقیق ۴۰ از شمارنده برای حفظ جذب‌های اضافه
+                    # کسر دقیق تعداد ضریب‌های ۴۰ از شمارنده جهت حفظ جذب‌های اضافی (مثلاً باقیمانده ۵ از ۸۵)
+                    deduct_amount = periods_reached * 40
                     c.execute(
-                        "UPDATE admins SET count=count-40 WHERE code=?", (code,)
+                        "UPDATE admins SET count=count-? WHERE code=?", (deduct_amount, code)
                     )
 
                 if reached_200:
@@ -534,7 +537,7 @@ async def on_startup(app: Application):
             )
             lead_name = getattr(sender, "first_name", None) or "کاربر"
 
-            # مدیریت جداگانه ارسال پیام‌ها به مالک و ادمین
+            # ارسال اعلان جذب جدید به مالک
             await safe_owner_message(
                 app.bot,
                 "جذب جدید ثبت شد.\n"
@@ -559,14 +562,16 @@ async def on_startup(app: Application):
             except Exception as e:
                 logger.error(f"Failed to send lead notification to admin {admin['user_id']}: {e}")
 
+            # اگر حدنصاب ۴۰تایی (یا چند برابر آن) رد شده باشد، به تعداد دوره‌ها پیام پاداش ارسال می‌شود
             if reached_40:
-                try:
-                    await app.bot.send_message(
-                        admin["user_id"],
-                        "به ۴۰ جذب رسیدی؛ پاداش این دوره ۲۰۰ هزار تومان است و شمارنده دوره جدید شروع شد.",
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send 40-target notification to admin {admin['user_id']}: {e}")
+                for _ in range(periods_reached):
+                    try:
+                        await app.bot.send_message(
+                            admin["user_id"],
+                            "به ۴۰ جذب رسیدی؛ پاداش این دوره ۲۰۰ هزار تومان است و شمارنده دوره جدید شروع شد.",
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send 40-target notification to admin {admin['user_id']}: {e}")
 
             if reached_200:
                 try:
@@ -578,10 +583,11 @@ async def on_startup(app: Application):
                     logger.error(f"Failed to send 200-target notification to admin {admin['user_id']}: {e}")
 
             if reached_40:
+                bonus_total = periods_reached * 200
                 await safe_owner_message(
                     app.bot,
-                    f"ادمین {admin['name']} (کد {code}) به ۴۰ جذب رسید؛ "
-                    "پرداخت ۲۰۰ هزار تومان باید بررسی شود.",
+                    f"ادمین {admin['name']} (کد {code}) به {periods_reached} دوره ۴۰تایی ({periods_reached * 40} جذب) رسید؛ "
+                    f"مبلغ مجموع پورسانت ({bonus_total} هزار تومان) باید بررسی شود.",
                 )
 
             if reached_200:
