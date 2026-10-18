@@ -2,6 +2,7 @@ import os
 import re
 import html
 import sqlite3
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,13 @@ from telegram.ext import (
 )
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+# تنظیم لاگینگ برای ثبت خطاها بدون توقف ربات
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
@@ -24,12 +32,10 @@ TZ = ZoneInfo("Asia/Tehran")
 client = None
 awaiting_admin = set()
 
-
 def db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def setup_db():
     with db() as c:
@@ -66,7 +72,6 @@ def setup_db():
             if column not in columns:
                 c.execute(sql)
 
-
 def new_code():
     with db() as c:
         used = {
@@ -81,10 +86,15 @@ def new_code():
         number += 1
     return str(number)
 
-
 def escape(value):
     return html.escape(str(value or ""))
 
+async def safe_owner_message(bot, text, **kwargs):
+    """تابع امن برای ارسال پیام به مالک ربات جهت جلوگیری از کرش در صورت بروز خطا"""
+    try:
+        await bot.send_message(OWNER_ID, text, **kwargs)
+    except Exception as e:
+        logger.error(f"Failed to send message to owner: {e}")
 
 def main_menu():
     return InlineKeyboardMarkup([
@@ -94,14 +104,12 @@ def main_menu():
         ]
     ])
 
-
 def welcome_keyboard():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
             "🔎شروع آموزش🔎", callback_data="training_start"
         )
     ]])
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -162,7 +170,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=welcome_keyboard(),
     )
 
-
 async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -171,7 +178,6 @@ async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "آیدی عددی ادمین رو بفرست یا پیام خودش رو فوروارد کن."
     )
-
 
 async def receive_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -205,8 +211,8 @@ async def receive_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_id,
                     "برای شروع آموزش و فعال‌سازی، /start رو بزن.",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to notify new admin: {e}")
             return
 
     if not target:
@@ -230,11 +236,9 @@ async def receive_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ادمین {target.first_name} ثبت شد. بهش بگو ربات رو استارت کنه."
     )
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     awaiting_admin.discard(OWNER_ID)
     await update.message.reply_text("عملیات لغو شد.")
-
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -259,7 +263,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text("\n\n".join(lines))
-
 
 async def admin_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -401,8 +404,8 @@ async def admin_callback(
             reply_markup=main_menu(),
         )
 
-        await context.bot.send_message(
-            OWNER_ID,
+        await safe_owner_message(
+            context.bot,
             "ادمین آموزش را تکمیل کرد.\n"
             f"نام: {admin['name']}\n"
             f"آیدی: {uid}\n"
@@ -428,7 +431,6 @@ async def admin_callback(
             reply_markup=main_menu(),
         )
 
-
 def normalize_digits(value):
     translation = str.maketrans(
         "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
@@ -436,21 +438,28 @@ def normalize_digits(value):
     )
     return value.translate(translation)
 
-
 async def on_startup(app: Application):
     global client
 
     if not SESSION_STRING:
-        await app.bot.send_message(
-            OWNER_ID,
-            "ربات مدیریتی اجرا شد؛ اتصال اکانت استخدام هنوز تنظیم نشده.",
+        await safe_owner_message(
+            app.bot,
+            "ربات مدیریتی اجرا شد؛ اتصال اکانت استخدام هنوز تنظیم نشده (SESSION_STRING خالی است).",
         )
         return
 
-    client = TelegramClient(
-        StringSession(SESSION_STRING), API_ID, API_HASH
-    )
-    await client.start()
+    try:
+        client = TelegramClient(
+            StringSession(SESSION_STRING), API_ID, API_HASH
+        )
+        await client.start()
+    except Exception as e:
+        logger.error(f"Failed to start Telethon client: {e}")
+        await safe_owner_message(
+            app.bot,
+            f"خطا در راه‌اندازی اکانت استخدام تلگرام (Telethon): {e}"
+        )
+        return
 
     @client.on(events.NewMessage(incoming=True))
     async def incoming(event):
@@ -524,8 +533,8 @@ async def on_startup(app: Application):
         lead_name = getattr(sender, "first_name", None) or "کاربر"
         count_after = 0 if reached_40 else period_count
 
-        await app.bot.send_message(
-            OWNER_ID,
+        await safe_owner_message(
+            app.bot,
             "جذب جدید ثبت شد.\n"
             f"ادمین: {admin['name']}\n"
             f"آیدی ادمین: {admin['user_id']}\n"
@@ -558,19 +567,19 @@ async def on_startup(app: Application):
                     "🎉 تبریک! به هدف ۲۰۰ جذب رسیدی. کارفرما از تکمیل هدفت مطلع شد.",
                 )
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to send notification to admin {admin['user_id']}: {e}")
 
         if reached_40:
-            await app.bot.send_message(
-                OWNER_ID,
+            await safe_owner_message(
+                app.bot,
                 f"ادمین {admin['name']} (کد {code}) به ۴۰ جذب رسید؛ "
                 "پرداخت ۲۰۰ هزار تومان باید بررسی شود.",
             )
 
         if reached_200:
-            await app.bot.send_message(
-                OWNER_ID,
+            await safe_owner_message(
+                app.bot,
                 "🎉 ادمین به هدف ۲۰۰ جذب رسید!\n"
                 f"نام: {admin['name']}\n"
                 f"آیدی: {admin['user_id']}\n"
@@ -578,10 +587,19 @@ async def on_startup(app: Application):
                 f"کل جذب‌ها: {updated['total']}",
             )
 
-    await app.bot.send_message(
-        OWNER_ID, "اتصال اکانت استخدام برقرار شد."
-    )
+    await safe_owner_message(app.bot, "اتصال اکانت استخدام برقرار شد.")
 
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM admins").fetchall()
+
+    lines = ["📊 گزارش ساعت ۱۰ شب جذبان"]
+    for a in rows:
+        lines.append(
+            f"{a['name']}: این دوره {a['count']} جذب | کل {a['total']}"
+        )
+
+    await safe_owner_message(context.bot, "\n".join(lines))
 
 def main():
     setup_db()
@@ -610,20 +628,6 @@ def main():
         )
 
     app.run_polling()
-
-
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    with db() as c:
-        rows = c.execute("SELECT * FROM admins").fetchall()
-
-    lines = ["📊 گزارش ساعت ۱۰ شب جذبان"]
-    for a in rows:
-        lines.append(
-            f"{a['name']}: این دوره {a['count']} جذب | کل {a['total']}"
-        )
-
-    await context.bot.send_message(OWNER_ID, "\n".join(lines))
-
 
 if __name__ == "__main__":
     main()
